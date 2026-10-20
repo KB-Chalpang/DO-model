@@ -19,7 +19,7 @@ library(cmdstanr)
 library(posterior)
 library(dplyr)
 
-path <- "C:/Users/ahw881/Downloads/nz_files/R"
+path <- "insert path"
 source(file.path(path, "prepare_nz_data.R"))
 
 # Settings 

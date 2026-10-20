@@ -4,7 +4,7 @@ author: "Kabiru Abubakari"
 date: "2026-08-11"
 output: html_document
 params:
-  data_dir:  "C:/Users/ahw881/OneDrive - Queen Mary, University of London/PhD_other/code_and_data/Results"     # folder containing the .rds files (relative to this file)
+  data_dir:  "insert path"     # folder containing the .rds files (relative to this file)
 ---
 
 ```{r setup, include=FALSE}

@@ -1,4 +1,4 @@
-// Presence-only-with-false-positives occupancy model for detection-only data.
+// Detection-only model.
 //   z_i ~ Bernoulli(psi_i)            latent occupancy
 //   q                                 probability a site is visited/recorded
 //   theta11 = q * P(y=1 | z=1)        theta10 = q * P(y=1 | z=0)
