@@ -1,0 +1,254 @@
+---
+title: "Case study: United Kingdom"
+author: "Kabiru Abubakari"
+date: "2026-08-11"
+output: html_document
+params:
+  data_path: "C:/Users/ahw881/Downloads/do_model_files/uk_data.xlsx"   # input data (.xlsx)
+  stan_path: "C:/Users/ahw881/Downloads/do_model_files/do_model_uk.stan"   # Stan model (.stan)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(cmdstanr)    # install: https://mc-stan.org/cmdstanr/
+library(posterior)
+library(bayesplot)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(mgcv)        # latitude detrending (GAM)
+library(readxl)
+library(sf)
+library(giscoR)
+library(knitr)
+library(kableExtra)
+
+set.seed(123)        # makes the random initial values reproducible
+```
+
+## Data
+
+Species columns hold the detection-only records, with 0's as pseudo-absences. The `species` and `covariates` vectors map the labels used in plots and tables (names) to the column names in the data (values).
+
+```{r data}
+species <- c("Dactylorhiza fuchsii" = "Dactylorhiza_fuchsii",
+             "Carex limosa"         = "Carex_limosa")
+
+covariates <- c(
+  "Rain"                 = "rain_resid",
+  "Temperature"          = "temp_resid",
+  "Dry nitrogen"         = "Nitro_dry",
+  "Wet nitrogen"         = "Nitro_wet",
+  "Bog"                  = "land_cover_Bog",
+  "ImprovedGrassland"    = "land_cover_ImprovedGrassland",
+  "AcidNeutralGrassland" = "land_cover_AcidNeutralGrassland",
+  "CalcareousGrassland"  = "land_cover_CalcareousGrassland",
+  "Rocky"                = "land_cover_Rocky",
+  "ArableHorticulture"   = "land_cover_ArableHorticulture",
+  "UrbanSuburban"        = "land_cover_UrbanSuburban",
+  "SedimentCoastal"      = "land_cover_SedimentCoastal",
+  "Heathland"            = "land_cover_Heathland",
+  "ConiferousWoodland"   = "land_cover_ConiferousWoodland",
+  "BroadleavedWoodland"  = "land_cover_BroadleavedWoodland",
+  "Latitude"             = "ycoord_scaled"
+)
+
+sites <- read_xlsx(params$data_path)
+
+# Standardise latitude, then replace rain and temperature by their residuals
+# after removing a smooth latitudinal trend (GAM)
+sites$ycoord_scaled <- as.numeric(scale(sites$ycoord_scaled))
+sites$rain_resid <- residuals(gam(rain        ~ s(ycoord_scaled), data = sites))
+sites$temp_resid <- residuals(gam(temperature ~ s(ycoord_scaled), data = sites))
+
+# Covariate matrix, with a check for missing values and non-binary records
+X <- as.matrix(sites[, covariates])
+stopifnot(!anyNA(X), all(unlist(sites[, species]) %in% 0:1))
+```
+
+## Model fitting
+
+The Stan model is read from the file given in `params$stan_path` and fitted to each species
+(4 chains, 2000 warm-up and 2000 sampling iterations per chain).
+
+```{r fit}
+model <- cmdstan_model(params$stan_path)
+K <- ncol(X)   # number of covariates
+
+# Random initial values for each chain
+make_init <- function() {
+  list(q = runif(1, 0.5, 0.8),
+       theta11 = runif(1, 0.15, 0.4), theta10 = runif(1, 0.01, 0.1),
+       beta0 = rnorm(1), beta = rnorm(K))
+}
+
+# Fit each species and store its sampling time (attribute "elapsed")
+fits <- lapply(species, function(col) {
+  t0  <- Sys.time()
+  fit <- model$sample(
+    data = list(N = nrow(X), K = K, y = sites[[col]], x = X),
+    seed = 123, chains = 4, parallel_chains = 4,
+    iter_warmup = 2000, iter_sampling = 2000,
+    refresh = 0, init = make_init
+  )
+  attr(fit, "elapsed") <- Sys.time() - t0
+  fit})
+
+# Computation time per species
+noquote(vapply(fits, function(f)
+  sprintf("%.1f minutes", as.numeric(attr(f, "elapsed"), units = "mins")), character(1)))
+```
+
+## Posterior predictive checks
+
+For each species: the mean and SD checks side by side, then a separate density overlay.
+
+```{r ppc-setup}
+color_scheme_set("blue")
+y_obs <- lapply(species, function(col) sites[[col]])                         # observed records
+y_rep <- lapply(fits, function(f) f$draws("ypred", format = "matrix"))       # replicated datasets (draws x sites)
+
+centred_title <- theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r ppc-mean-sd, fig.width=10, fig.height=4, out.width="100%"}
+for (sp in names(species)) {
+  p_mean <- ppc_stat(y_obs[[sp]], y_rep[[sp]], stat = "mean")
+  p_sd   <- ppc_stat(y_obs[[sp]], y_rep[[sp]], stat = "sd")
+  print((p_mean | p_sd) +
+          plot_annotation(title = sp, theme = centred_title))
+}
+```
+
+```{r ppc-density, fig.width=6, fig.height=4, fig.align="center"}
+for (sp in names(species)) {
+  print(ppc_dens_overlay(y_obs[[sp]], y_rep[[sp]]) +
+          scale_color_manual(values = c("darkblue", "lightblue")) +
+          ggtitle(sp) + centred_title)
+}
+```
+
+## Posterior summaries
+
+```{r summary}
+# Posterior mean, SD, 95% credible interval and convergence diagnostics for each species
+summ <- lapply(fits, function(f) {
+  f$summary(
+    variables = c("beta0", "beta", "theta11", "theta10"),
+    mean, sd, ~quantile2(.x, probs = c(0.025, 0.975)),
+    rhat, ess_bulk, ess_tail
+  )
+})
+
+# Row labels: parameter readable names
+param_labels <- c(
+  beta0 = "Intercept",
+  setNames(names(covariates), paste0("beta[", seq_along(covariates), "]")),
+  theta11 = "theta11", theta10 = "theta10"
+)
+
+# One row per parameter, three columns per species
+wide_table <- function(make_cols) {
+  out <- do.call(cbind, lapply(summ, make_cols))
+  out <- cbind(Coefficient = param_labels[summ[[1]]$variable], out)
+  rownames(out) <- NULL
+  out
+}
+
+# Common table layout (HTML or LaTeX)
+make_table <- function(tab, labels, digits, caption, format = "html") {
+  k <- kable(tab, format = format, booktabs = (format == "latex"),
+             digits = c(0, rep(digits, length(species))),
+             align = c("l", rep("c", ncol(tab) - 1)),
+             col.names = c("Coefficient", rep(labels, length(species))),
+             caption = caption, escape = FALSE) |>
+    add_header_above(c(" " = 1, setNames(rep(length(labels), length(species)), names(species))),
+                     bold = TRUE, align = "c")
+  if (format == "html")
+    k <- kable_styling(k, bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+  k
+}
+
+post_tab <- wide_table(function(s)
+  data.frame(Mean = s$mean, SD = s$sd, CI = sprintf("(%.3f, %.3f)", s$q2.5, s$q97.5)))
+```
+
+The table is shown here and also saved as a LaTeX file (`posterior_summary.tex`).
+
+```{r posterior-table}
+make_table(post_tab, c("Mean", "SD", "95% CI"), c(3, 3, 3),
+           "Posterior summary of model coefficients")
+writeLines(make_table(post_tab, c("Mean", "SD", "95\\% CI"), c(3, 3, 3),
+                      "Posterior summary of model coefficients", "latex"),
+           "posterior_summary.tex")
+```
+
+## Convergence diagnostics
+
+R-hat should be close to 1 (below 1.01), and bulk and tail ESS should be at least a few hundred
+(ideally more than 400 across four chains). The table is also saved as `convergence_diagnostics.tex`.
+
+```{r convergence-table}
+diag_tab <- wide_table(function(s)
+  data.frame(Rhat = s$rhat, ESS_bulk = s$ess_bulk, ESS_tail = s$ess_tail))
+
+make_table(diag_tab, c("R-hat", "Bulk ESS", "Tail ESS"), c(3, 0, 0),
+           "Convergence diagnostics for all parameters")
+writeLines(make_table(diag_tab, c("R-hat", "Bulk ESS", "Tail ESS"), c(3, 0, 0),
+                      "Convergence diagnostics for all parameters", "latex"),
+           "convergence_diagnostics.tex")
+```
+
+## Maps
+
+Observed records and posterior mean occupancy probability for each species. Each site is drawn as a
+10 km x 10 km hectad in the British National Grid (EPSG:27700).
+
+```{r maps, fig.width=10, fig.height=6}
+# Hectad polygons: square buffer (half-width 5 km) around each site centroid
+hectads <- sites |>
+  st_as_sf(coords = c("xcoord", "ycoord"), crs = 4326) |>
+  st_transform(27700) |>
+  st_buffer(5000, endCapStyle = "SQUARE") |>
+  st_geometry()
+
+# Great Britain outline (Northern Ireland excluded)
+gb <- gisco_get_nuts(nuts_level = "1", year = "2021", resolution = "1", country = "GBR") |>
+  subset(!grepl("Northern Ireland", NUTS_NAME)) |>
+  st_transform(27700) |>
+  st_union()
+gb_buffer <- st_buffer(gb, 10000)
+
+bb <- st_bbox(hectads) + c(-20000, -20000, 20000, 20000)   # map extent: site bounding box plus 20 km
+
+map_theme <- theme_minimal() +
+  theme(panel.grid = element_blank(), panel.border = element_rect(colour = "black", fill = NA),
+        axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Map of the hectads coloured by `fill`, with the Great Britain outline
+base_map <- function(d, fill_scale) {
+  ggplot() +
+    geom_sf(data = d, aes(fill = fill), colour = NA) +
+    geom_sf(data = gb_buffer, fill = NA, colour = "white", linewidth = 0.1) +
+    geom_sf(data = gb, fill = NA, colour = "black", linewidth = 0.1) +
+    fill_scale +
+    coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], expand = FALSE) +
+    map_theme
+}
+
+cols <- viridisLite::viridis(2)
+
+for (sp in names(species)) {
+  obs  <- factor(sites[[species[[sp]]]], levels = c(1, 0))
+  pred <- fits[[sp]]$summary("Pr_z_eq_1", "mean")$mean   # posterior mean Pr(z = 1) at each site
+
+  p_obs <- base_map(st_sf(fill = obs, geometry = hectads),
+                    scale_fill_manual(values = c("1" = cols[1], "0" = cols[2]), name = ""))
+  p_pred <- base_map(st_sf(fill = pred, geometry = hectads),
+                     scale_fill_viridis_c(direction = -1, name = "",
+                                          breaks = c(0, 0.12, 0.50, 0.95)))
+  print(p_obs + p_pred + plot_annotation(title = sp, theme = centred_title))
+}
+```

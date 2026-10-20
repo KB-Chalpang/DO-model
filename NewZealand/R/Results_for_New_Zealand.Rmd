@@ -1,0 +1,238 @@
+---
+title: "Case study: New Zealand"
+author: "Kabiru Abubakari"
+date: "2026-08-11"
+output: html_document
+params:
+  data_dir:  "C:/Users/ahw881/OneDrive - Queen Mary, University of London/PhD_other/code_and_data/Results"     # folder containing the .rds files (relative to this file)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(bayesplot)   # theme and density overlay
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+set.seed(123)        # used when sub-sampling draws for the density overlay
+dir.create("tables", showWarnings = FALSE)
+```
+
+## Inputs
+
+For each species `<sp>`, the Results folder `params$data_dir` must contain
+
+- `y_obs_do_<sp>.rds` and `yrep_do_<sp>.rds`: observed data and posterior predictive draws (draws x sites) of the DO-M model;
+- `results_rep_occ_<sp>.rds` (DN-1-M) and `results_rep_po_do1_<sp>.rds` (DO-M): posterior summaries with columns
+  `parameter`, `post_mean`, `post_sd`, `q2.5`, `q97.5`, `rhat`, `ess_bulk`, `ess_tail`.
+
+```{r inputs}
+species <- c("nz42" = "nz42",       # names = labels used in plots and tables (replace with species names)
+             "nz35" = "nz35")       # values = file suffixes
+
+models <- c("DN-1-M" = "results_rep_occ",
+            "DO-M"   = "results_rep_po_do1")
+
+beta_labels <- c(beta0 = "Intercept", beta1 = "Age0", beta2 = "Age1", beta3 = "Deficit",
+                 beta4 = "Dem", beta5 = "Hillshade", beta6 = "Mas", beta7 = "Rain",
+                 beta8 = "Slope", beta9 = "Sseas", beta10 = "Tseas", beta11 = "Latitude")
+
+read_nz <- function(prefix, sp) readRDS(file.path(params$data_dir, sprintf("%s_%s.rds", prefix, sp)))
+
+y_obs   <- lapply(species, function(sp) read_nz("y_obs_do", sp))
+results <- lapply(models,  function(m) lapply(species, function(sp) read_nz(m, sp)))
+
+needed <- c("parameter", "post_mean", "post_sd", "q2.5", "q97.5", "rhat", "ess_bulk", "ess_tail")
+stopifnot(all(vapply(unlist(results, recursive = FALSE), function(r) all(needed %in% names(r)), logical(1))))
+```
+
+## Posterior predictive checks (DO-M)
+
+The replicated datasets (draws x sites) are large, and `bayesplot::ppc_stat()` reshapes them into a
+very long data frame, which exhausts memory. Instead, each species' replicates are loaded one at a time,
+the mean and SD of every replicated dataset are computed in blocks of rows, a random subset of 100
+replicates is kept for the density overlay, and the full matrix is then discarded.
+
+```{r ppc-summaries}
+row_stats <- function(m, block = 500) {
+  blocks <- split(seq_len(nrow(m)), ceiling(seq_len(nrow(m)) / block))
+  bind_rows(lapply(blocks, function(i) {
+    b  <- m[i, , drop = FALSE]
+    mu <- rowMeans(b)
+    data.frame(mean = mu, sd = sqrt(rowSums((b - mu)^2) / (ncol(b) - 1)))
+  }))
+}
+
+ppc <- lapply(species, function(sp) {
+  yrep <- read_nz("yrep_do", sp)
+  out  <- list(stats = row_stats(yrep),
+               dens  = yrep[sample(nrow(yrep), 100), , drop = FALSE])
+  rm(yrep); invisible(gc())
+  out
+})
+```
+
+```{r ppc-plots, fig.width=10, fig.height=4, out.width="100%"}
+centred_title <- theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Same look as bayesplot::ppc_stat() (blue scheme), built from pre-computed statistics
+stat_plot <- function(T_rep, T_obs, stat) {
+  ggplot(data.frame(T_rep = T_rep), aes(T_rep)) +
+    geom_histogram(aes(fill = "rep"), bins = 30, colour = "#6497b1", linewidth = 0.2) +
+    geom_vline(data = data.frame(T_obs = T_obs), aes(xintercept = T_obs, colour = "obs"),
+               linewidth = 1.5) +
+    scale_fill_manual(NULL, breaks = "rep", values = c(rep = "#b3cde0"),
+                      labels = expression(T(y[rep]))) +
+    scale_colour_manual(NULL, breaks = "obs", values = c(obs = "#011f4b"),
+                        labels = expression(T(y))) +
+    labs(x = paste("T =", stat), y = NULL) +
+    theme_default() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+}
+
+for (sp in names(species)) {
+  p_mean <- stat_plot(ppc[[sp]]$stats$mean, mean(y_obs[[sp]]), "mean")
+  p_sd   <- stat_plot(ppc[[sp]]$stats$sd,   sd(y_obs[[sp]]),   "sd")
+  print((p_mean | p_sd) + plot_layout(guides = "collect") +
+          plot_annotation(title = sp, theme = centred_title))
+}
+```
+
+```{r ppc-density, fig.width=6, fig.height=4, fig.align="center"}
+color_scheme_set("blue")
+for (sp in names(species)) {
+  print(ppc_dens_overlay(y_obs[[sp]], ppc[[sp]]$dens) +
+          scale_color_manual(values = c("darkblue", "lightblue")) +
+          ggtitle(sp) + centred_title)
+}
+```
+
+## Agreement plots
+
+Posterior means and 95% credible intervals of the regression coefficients under both models.
+
+```{r agreement, fig.width=7, fig.height=6, fig.align="center"}
+agreement_data <- function(sp) {
+  bind_rows(lapply(names(models), function(m) {
+    r <- results[[m]][[sp]]
+    r <- r[r$parameter %in% names(beta_labels), ]
+    data.frame(coefficient = factor(unname(beta_labels[r$parameter]), levels = beta_labels),
+               model = m, mean = r$post_mean, low = r$q2.5, high = r$q97.5)
+  }))
+}
+
+for (sp in names(species)) {
+  print(
+    ggplot(agreement_data(sp), aes(x = mean, y = coefficient, colour = model, shape = model)) +
+      geom_point(position = position_dodge(width = 0.5), size = 2.8) +
+      geom_errorbar(aes(xmin = low, xmax = high), orientation = "y",
+                    position = position_dodge(width = 0.5), width = 0.35, linewidth = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      scale_colour_manual(values = c("DN-1-M" = "black", "DO-M" = "red")) +
+      scale_shape_manual(values = c("DN-1-M" = 16, "DO-M" = 17)) +
+      coord_fixed(ratio = 0.5, xlim = c(-4, 4)) +
+      labs(title = paste0(sp, ": posterior means and 95% credible intervals"),
+           x = NULL, y = "Parameters", colour = "Model", shape = "Model") +
+      theme_minimal() +
+      theme(panel.border = element_rect(colour = "black", fill = NA),
+            axis.text = element_text(size = 10, face = "bold"),
+            plot.title = element_text(hjust = 0.5, face = "bold"),
+            legend.position = "bottom")
+  )
+}
+```
+
+## Tables
+
+One posterior summary table and one convergence table per species, with the two models side by side
+(a dash marks parameters that a model does not have). `q` and the mean occupancy are shown only in the
+`.tex` files, which are saved in `tables/`.
+
+```{r table-helpers}
+param_order <- c(names(beta_labels), "p11", "p10", "theta11", "theta10", "q", "mean_z")
+
+coef_label <- function(x, format) {
+  special <- if (format == "latex")
+    c(p11 = "$p_{11}$", p10 = "$p_{10}$", theta11 = "$\\theta_{11}$", theta10 = "$\\theta_{10}$",
+      q = "$q$", mean_z = "Mean occupancy")
+  else
+    c(p11 = "<i>p</i><sub>11</sub>", p10 = "<i>p</i><sub>10</sub>",
+      theta11 = "<i>&theta;</i><sub>11</sub>", theta10 = "<i>&theta;</i><sub>10</sub>",
+      q = "<i>q</i>", mean_z = "Mean occupancy")
+  labels <- c(beta_labels, special)
+  unname(ifelse(x %in% names(labels), labels[x], x))
+}
+
+num <- function(x, dash) ifelse(is.na(x), dash, sprintf("%.3f", x))
+
+# Column definitions: header labels (html / latex) and how to format a model's block of results
+table_types <- list(
+  posterior = list(
+    name   = "Posterior summary of model coefficients",
+    header = list(html  = c("Mean", "SD", "95% CI"),
+                  latex = c("Mean", "SD", "95\\% CI")),
+    cols   = function(a, dash)
+      data.frame(Mean = num(a$post_mean, dash), SD = num(a$post_sd, dash),
+                 CI = ifelse(is.na(a$q2.5), dash, sprintf("(%.3f, %.3f)", a$q2.5, a$q97.5)))),
+  diagnostics = list(
+    name   = "Stan diagnostics",
+    header = list(html  = c("<i>R&#770;</i>", "<i>ESS</i><sub>bulk</sub>", "<i>ESS</i><sub>tail</sub>"),
+                  latex = c("$\\hat{R}$", "$ESS_{bulk}$", "$ESS_{tail}$")),
+    cols   = function(a, dash)
+      data.frame(Rhat = num(a$rhat, dash), Bulk = num(a$ess_bulk, dash), Tail = num(a$ess_tail, dash)))
+)
+
+make_table <- function(sp, type, format = "html") {
+  tt   <- table_types[[type]]
+  dash <- if (format == "latex") "---" else "&mdash;"
+
+  res    <- lapply(names(models), function(m) results[[m]][[sp]])
+  params <- unique(unlist(lapply(res, `[[`, "parameter")))
+  params <- c(intersect(param_order, params), setdiff(params, param_order))
+  if (format == "html") params <- setdiff(params, c("q", "mean_z"))   # shown only in the .tex files
+
+  blocks <- lapply(res, function(r) tt$cols(r[match(params, r$parameter), ], dash))
+  tab    <- cbind(Coefficient = coef_label(params, format), do.call(cbind, blocks))
+  rownames(tab) <- NULL
+
+  sp_label <- if (format == "latex") paste0("\\textit{", sp, "}") else paste0("<i>", sp, "</i>")
+  k <- kable(tab, format = format, booktabs = (format == "latex"), align = c("l", rep("c", ncol(tab) - 1)),
+             col.names = c("Coefficient", rep(tt$header[[format]], length(models))),
+             caption = paste(tt$name, sp_label), escape = FALSE) |>
+    add_header_above(c(" " = 1, setNames(rep(3, length(models)), names(models))), bold = TRUE, align = "c")
+  if (format == "html")
+    k <- kable_styling(k, bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+  k
+}
+```
+
+```{r tables-tex}
+# LaTeX versions (all rows, including q and mean occupancy)
+for (sp in names(species))
+  for (type in names(table_types))
+    writeLines(make_table(sp, type, "latex"), file.path("tables", sprintf("%s_%s.tex", type, sp)))
+```
+
+### First species
+
+```{r table-sp1-posterior}
+make_table(names(species)[1], "posterior")
+```
+
+```{r table-sp1-diagnostics}
+make_table(names(species)[1], "diagnostics")
+```
+
+### Second species
+
+```{r table-sp2-posterior}
+make_table(names(species)[2], "posterior")
+```
+
+```{r table-sp2-diagnostics}
+make_table(names(species)[2], "diagnostics")
+```
+
