@@ -1,0 +1,167 @@
+# Five-fold cross-validation for DO.
+# Usage: Rscript model_ajob_pp_do.R [q]
+# q may be 0.5 or 1; it defaults to the value in Section 2.
+# One SLURM/SGE array task is one simulation replicate. Outside an array, the
+# replicate defaults to 1. All model scripts use matching data and outer folds
+# for identical replicate IDs, covariates, simulation settings, etc.
+
+# 1. Replicate and dependencies 
+task_text <- Sys.getenv("SLURM_ARRAY_TASK_ID", "")
+if (!nzchar(task_text)) task_text <- Sys.getenv("SGE_TASK_ID", "")
+if (!nzchar(task_text)) task_text <- "1"
+task_number <- suppressWarnings(as.numeric(task_text))
+if (!is.finite(task_number) || task_number < 1 || task_number != floor(task_number) ||
+    task_number > .Machine$integer.max - 1000) stop("Invalid replicate ID.")
+task_id <- as.integer(task_number)
+set.seed(1000 + task_id)
+library(cmdstanr)
+library(pROC)
+
+# 2. Inputs, simulation settings and output directory
+q <- 1
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 1L) stop("Usage: Rscript model_ajob_pp_do.R [0.5|1]")
+if (length(args)) q <- suppressWarnings(as.numeric(args[[1L]]))
+if (!is.finite(q) || !q %in% c(0.5, 1)) stop("q must be 0.5 or 1.")
+
+covariate_file <- "~/covariates_fixed2.rds"
+x <- readRDS(covariate_file)
+predictors <- c("x1", "x2", "x3")
+if (!is.data.frame(x) || !all(predictors %in% names(x))) {
+  stop("Covariates must be a data frame with x1, x2 and x3.")
+}
+if (!all(vapply(x[predictors], function(a) is.numeric(a) && all(is.finite(a)), logical(1)))) {
+  stop("Predictors must be numeric without missing or infinite values.")
+}
+model_file <- "~/mystanmodel_do_misspec2.rds"
+stan_model <- readRDS(model_file)
+
+beta0 <- 0
+beta1 <- 1.2
+beta2 <- 1
+beta3 <- -1
+p11 <- 0.80
+p10 <- 0.05
+T_visits <- 3L
+K <- 5L
+if (nrow(x) < K) stop("At least K sites are needed for K-fold CV.")
+q_tag <- if (q == 0.5) "05" else "1"
+results_dir <- paste0("summaries_pp_do_q", q_tag)
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Running DO replicate", task_id, "with q =", q, "\n")
+
+# 3. Simulate occupancy and observed records 
+# q controls site visitation. Unvisited sites become zero records; occupied
+# sites can be missed, and unoccupied sites can generate false positives.
+# Retain the order of all detection draws across three visits, even though
+# only the first misclassified record is fitted. Removing those other draws
+# would change the random numbers used at subsequent sites.
+simulate_data <- function(x, T_visits, q, beta0, beta1, beta2, beta3, p11, p10) {
+  N <- nrow(x)
+  psi <- plogis(beta0 + beta1 * x$x1 + beta2 * x$x2 + beta3 * x$x3)
+  z <- rbinom(N, 1, psi)
+  v <- rbinom(N, 1, q)
+  first_record <- rep(NA_real_, N)
+  for (i in seq_len(N)) {
+    if (v[i] == 1L) {
+      for (t in seq_len(T_visits)) {
+        invisible(rbinom(1L, 1, z[i] * p11))
+        if (z[i] == 1L) {
+          record <- rbinom(1L, 1, p11)
+        } else {
+          record <- rbinom(1L, 1, p10)
+        }
+        if (t == 1L) first_record[i] <- record
+      }
+    }
+  }
+  first_record[is.na(first_record)] <- 0
+  data.frame(z = z, y = first_record, x1 = x$x1, x2 = x$x2, x3 = x$x3)
+}
+data_cv <- simulate_data(x, T_visits, q, beta0, beta1, beta2, beta3, p11, p10)
+
+# 4. Assign outer cross-validation folds
+# Balanced fold sizes are randomised with the same fixed seed in every script.
+# Training uses observed records y; evaluation uses held-out true occupancy z.
+set.seed(123)
+data_cv$fold <- sample(rep(1:K, length.out = nrow(data_cv)))
+cv_results <- vector("list", K)
+
+# 5. Fit and evaluate each outer fold 
+# Fixed initialisation for each chain; derived p11 and p10 are not initialised.
+init_fun <- function() {
+  list(q = 0.5, theta11 = 0.3, theta10 = 0.01,
+       beta0 = 0, beta1 = 0, beta2 = 0, beta3 = 0)
+}
+
+start_time <- Sys.time()
+for (k in seq_len(K)) {
+  cat("Fold", k, "\n")
+  train_data <- data_cv[data_cv$fold != k, , drop = FALSE]
+  test_data <- data_cv[data_cv$fold == k, , drop = FALSE]
+  stan_data <- list(N = nrow(train_data), y = train_data$y,
+                    x1 = train_data$x1, x2 = train_data$x2, x3 = train_data$x3)
+  # No explicit Stan seed is supplied, matching this workflow's sampling call.
+  model_fit <- stan_model$sample(
+    data = stan_data, seed = 123 + task_id, chains = 4, parallel_chains = 4,
+    iter_warmup = 2000, iter_sampling = 2000, refresh = 0, init = init_fun
+  )
+  draws <- model_fit$draws(
+    c("beta0", "beta1", "beta2", "beta3", "theta11", "theta10"), format = "matrix"
+  )
+  S <- nrow(draws)
+  Nt <- nrow(test_data)
+  p_obs <- matrix(NA, S, Nt)
+  # Each row stores record probabilities from one posterior draw. These
+  # probabilities are evaluated against z below, not against record labels y.
+  for (s in seq_len(S)) {
+    psi <- plogis(draws[s, "beta0"] + draws[s, "beta1"] * test_data$x1 +
+                    draws[s, "beta2"] * test_data$x2 + draws[s, "beta3"] * test_data$x3)
+    p_obs[s, ] <- draws[s, "theta11"] * psi + draws[s, "theta10"] * (1 - psi)
+  }
+  y_test <- test_data$z
+  elpd <- brier <- auc <- numeric(S)
+  # Compute each score separately for every draw. In particular, log scores
+  # are averaged after taking logs; this is not log of a posterior mean.
+  for (s in seq_len(S)) {
+    p <- pmin(pmax(p_obs[s, ], 1e-6), 1 - 1e-6)
+    elpd[s] <- sum(y_test * log(p) + (1 - y_test) * log(1 - p))
+    brier[s] <- mean((y_test - p)^2)
+    auc[s] <- as.numeric(pROC::auc(y_test, p, quiet = TRUE))
+  }
+  cv_results[[k]] <- list(elpd = elpd, brier = brier, auc = auc)
+}
+elapsed_seconds <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+# 6. Summarize fold metrics 
+# Average the within-fold posterior means. Bounds average the within-fold
+# posterior quantiles; they are not pooled-draw quantiles or CV confidence limits.
+metric_names <- c("elpd", "brier", "auc")
+summary_results <- data.frame(
+  Metric = c("ELPD", "Brier", "AUC"),
+  Mean = vapply(metric_names, function(metric) {
+    mean(vapply(cv_results, function(result) mean(result[[metric]]), numeric(1)))
+  }, numeric(1)),
+  CI_lower = vapply(metric_names, function(metric) {
+    mean(vapply(cv_results, function(result) quantile(result[[metric]], 0.025), numeric(1)))
+  }, numeric(1)),
+  CI_upper = vapply(metric_names, function(metric) {
+    mean(vapply(cv_results, function(result) quantile(result[[metric]], 0.975), numeric(1)))
+  }, numeric(1)),
+  row.names = NULL
+)
+
+# 7. Save the summary and the fold-level values used to construct it 
+# Summary column names remain Metric, Mean, CI_lower and CI_upper. See the
+# README for their exact calculation; the labels do not define a new interval.
+saveRDS(summary_results, file.path(results_dir, paste0("summary_df_do_rep_", task_id, ".rds")))
+saveRDS(cv_results, file.path(results_dir, paste0("fold_metrics_do_rep_", task_id, ".rds")))
+saveRDS(list(
+  model = "do", replicate = task_id, q = q, beta0 = beta0,
+  beta1 = beta1, beta2 = beta2, beta3 = beta3, p11 = p11, p10 = p10,
+  T_visits = T_visits, K = K, simulation_seed = 1000 + task_id,
+  fold_seed = 123, fold_assignment = data_cv$fold,
+  covariate_file = path.expand(covariate_file),
+  elapsed_seconds = elapsed_seconds, session_info = utils::sessionInfo()
+), file.path(results_dir, paste0("settings_do_rep_", task_id, ".rds")))
+cat("Finished DO replicate", task_id, "in", elapsed_seconds, "seconds\n")
