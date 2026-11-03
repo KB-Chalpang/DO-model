@@ -1,6 +1,6 @@
 ---
 title: "Case study: United Kingdom"
-author: "Kabiru Abubakari"
+author: ""
 date: "2026-08-11"
 output: html_document
 params:
