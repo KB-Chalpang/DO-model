@@ -4,8 +4,8 @@ author: "Kabiru Abubakari"
 date: "2026-08-11"
 output: html_document
 params:
-  data_path: "C:/Users/ahw881/Downloads/do_model_files/uk_data.xlsx"   # input data (.xlsx)
-  stan_path: "C:/Users/ahw881/Downloads/do_model_files/do_model_uk.stan"   # Stan model (.stan)
+  data_path: "your path/uk_data.xlsx"   # input data (.xlsx)
+  stan_path: "your path/do_model_files/do_model_uk.stan"   # Stan model (.stan)
 ---
 
 ```{r setup, include=FALSE}
